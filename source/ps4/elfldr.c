@@ -39,6 +39,8 @@ along with this program; see the file COPYING. If not, see
 #include <ps4/klog.h>
 #include <ps4/mdbg.h>
 
+#include "sysmodule_ids.h"
+
 #include "elfldr.h"
 #include "log.h"
 #include "mem.h"
@@ -223,18 +225,14 @@ elfldr_load_needed_modules(pid_t pid, const uint8_t *elf) {
       }
 
       unsigned int sysmodule = 0;
-      if(!strcmp(name, "libSceSystemService.sprx"))
-        sysmodule = 0x80000010;
-      else if(!strcmp(name, "libSceUserService.sprx"))
-        sysmodule = 0x80000011;
-      else if(!strcmp(name, "libSceNet.sprx"))
-        sysmodule = 0x8000001c;
-      else if(!strcmp(name, "libSceAudioOut.sprx"))
-        sysmodule = 0x80000001;
-      else if(!strcmp(name, "libScePad.sprx"))
-        sysmodule = 0x80000024;
-      else if(!strcmp(name, "libSceVideoOut.sprx"))
-        sysmodule = 0x80000022;
+      for(size_t m = 0; m < sizeof(sysmodule_internal_table)
+                                / sizeof(sysmodule_internal_table[0]);
+          ++m) {
+        if(!strcmp(name, sysmodule_internal_table[m].name)) {
+          sysmodule = sysmodule_internal_table[m].id;
+          break;
+        }
+      }
       if(sysmodule && load_sysmodule) {
         uint64_t sysmodule_args[6] = { sysmodule };
         intptr_t sysmodule_result = -1;
