@@ -101,11 +101,11 @@ the start-up notification.
 ## Use as a library
 
 The build also produces `build/ps#/lib-elfldr.a` and the public header
-`headers/shared/elfldr.h`. Link the matching `lib-ptrace` archive after
+`headers/elfldr.h`. Link the matching `lib-ptrace` archive after
 `lib-elfldr.a`:
 
 ```make
-CFLAGS += -I/path/to/elfldr/headers/shared -I/path/to/lib-ptrace/headers
+CFLAGS += -I/path/to/elfldr/headers -I/path/to/lib-ptrace/headers
 LDFLAGS += /path/to/elfldr/build/ps4/lib-elfldr.a \
            /path/to/lib-ptrace/build/ps4/libptrace.a
 ```

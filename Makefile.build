@@ -8,7 +8,7 @@ PTRACE_DIR ?= deps/lib-ptrace
 PTRACE_CHECKOUT := $(PTRACE_DIR)/.git
 PTRACE := $(PTRACE_DIR)/build/$(PLATFORM)/libptrace.a
 
-CFLAGS += -Iheaders/shared -Iheaders/$(PLATFORM) -I$(BUILD_DIR)
+CFLAGS += -Iheaders -Iheaders/$(PLATFORM) -I$(BUILD_DIR)
 CFLAGS += -I$(PTRACE_DIR)/headers -I$(PTRACE_DIR)/include
 
 vpath %.c source/shared source/$(PLATFORM)
