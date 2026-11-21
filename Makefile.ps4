@@ -1,0 +1,73 @@
+#   Copyright (C) 2025 John Törnblom
+#   Copyright (C) 2026 ItsJokerZz
+#
+# This file is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not see
+# <http://www.gnu.org/licenses/>.
+
+PS4_HOST ?= ps4
+PS4_PORT ?= 9020
+
+ifdef PS4_PAYLOAD_SDK
+    include $(PS4_PAYLOAD_SDK)/toolchain/orbis.mk
+else
+    $(error PS4_PAYLOAD_SDK is undefined)
+endif
+
+PLATFORM := ps4
+ELF := build/ps4/elfldr-ps4.elf
+BIN := build/ps4/elfldr-ps4.bin
+LIB := build/ps4/lib-elfldr.a
+
+CFLAGS := -fPIC -Wall -Werror -g -mstackrealign
+
+include Makefile.build
+
+all: $(ELF) $(BIN) $(LIB)
+
+$(OBJ_DIR)/elfldr.o: source/ps4/elfldr.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/elfldr_shared.o: source/shared/elfldr.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+
+$(LIB): $(addprefix $(OBJ_DIR)/,elfldr.o elfldr_shared.o mem.o)
+	@mkdir -p $(BUILD_DIR)
+	$(AR) rcs $@ $^
+
+$(OBJ_DIR)/socksrv.elf: $(addprefix $(OBJ_DIR)/,socksrv.o elfldr.o elfldr_shared.o mem.o uri.o selfldr.o notify.o) $(PTRACE)
+	$(CC) $(CFLAGS) -lSceSsl -lSceHttp $^ -o $@
+
+$(OBJ_DIR)/bootstrap-elf.o: source/ps4/bootstrap-elf.c $(OBJ_DIR)/socksrv.elf
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+
+$(ELF): $(addprefix $(OBJ_DIR)/,bootstrap-elf.o elfldr.o elfldr_shared.o mem.o notify.o) $(PTRACE)
+	$(CC) $(CFLAGS) $^ -o $@
+
+$(OBJ_DIR)/bootstrap-bin.o: source/ps4/bootstrap-bin.c $(ELF)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/bootstrap-bin.elf: $(OBJ_DIR)/bootstrap-bin.o
+	$(LD) -T source/ps4/bin_x86_64.x -o $@ $<
+
+$(BIN): $(OBJ_DIR)/bootstrap-bin.elf
+	$(OBJCOPY) -O binary --only-section=.text $< $@
+
+test: $(ELF)
+	$(PS4_DEPLOY) -h $(PS4_HOST) -p $(PS4_PORT) $^

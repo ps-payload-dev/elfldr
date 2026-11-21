@@ -1,0 +1,74 @@
+#   Copyright (C) 2025 John Törnblom
+#   Copyright (C) 2026 ItsJokerZz
+#
+# This file is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; see the file COPYING. If not see
+# <http://www.gnu.org/licenses/>.
+
+PS5_HOST ?= ps5
+PS5_PORT ?= 9020
+
+ifdef PS5_PAYLOAD_SDK
+    include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
+else
+    $(error PS5_PAYLOAD_SDK is undefined)
+endif
+
+PLATFORM := ps5
+ELF := build/ps5/elfldr-ps5.elf
+LIB := build/ps5/lib-elfldr.a
+
+CFLAGS := -Wall -Werror -O1
+LDADD  := -lSceSsl -lSceHttp
+
+include Makefile.build
+
+all: $(ELF) $(LIB)
+
+$(OBJ_DIR)/elfldr.o: source/ps5/elfldr.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/elfldr_shared.o: source/shared/elfldr.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+
+$(LIB): $(addprefix $(OBJ_DIR)/,elfldr.o elfldr_shared.o mem.o)
+	@mkdir -p $(BUILD_DIR)
+	$(AR) rcs $@ $^
+
+$(OBJ_DIR)/bootstrap.o: source/ps5/bootstrap.c $(OBJ_DIR)/socksrv.elf
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/main.o: source/ps5/main.c $(OBJ_DIR)/bootstrap.elf
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJ_DIR)/bootstrap.elf: $(addprefix $(OBJ_DIR)/,bootstrap.o elfldr.o elfldr_shared.o mem.o notify.o) $(PTRACE)
+	$(CC) -o $@ $^
+	$(STRIP) $@
+
+$(OBJ_DIR)/socksrv.elf: $(addprefix $(OBJ_DIR)/,socksrv.o selfldr.o elfldr.o elfldr_shared.o mem.o notify.o uri.o) $(PTRACE)
+	$(CC) -o $@ $^ $(LDADD)
+	$(STRIP) $@
+
+$(ELF): $(addprefix $(OBJ_DIR)/,main.o elfldr.o elfldr_shared.o mem.o notify.o) $(PTRACE)
+	$(CC) -o $@ $^
+	$(STRIP) $@
+
+test: $(ELF)
+	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) $^
+
+.INTERMEDIATE: $(OBJ_DIR)/socksrv.elf $(OBJ_DIR)/bootstrap.elf

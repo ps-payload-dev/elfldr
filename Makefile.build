@@ -1,0 +1,35 @@
+.DEFAULT_GOAL := all
+
+BUILD_DIR := build/$(PLATFORM)
+OBJ_DIR := $(BUILD_DIR)/objects
+
+PTRACE_REPO ?= https://github.com/ps-payload-dev/lib-ptrace.git
+PTRACE_DIR ?= deps/lib-ptrace
+PTRACE_CHECKOUT := $(PTRACE_DIR)/.git
+PTRACE := $(PTRACE_DIR)/build/$(PLATFORM)/libptrace.a
+
+CFLAGS += -Iheaders/shared -Iheaders/$(PLATFORM) -I$(BUILD_DIR)
+CFLAGS += -I$(PTRACE_DIR)/headers -I$(PTRACE_DIR)/include
+
+vpath %.c source/shared source/$(PLATFORM)
+
+.PHONY: all clean test format
+
+all test: $(PTRACE_CHECKOUT)
+
+$(PTRACE_CHECKOUT):
+	@mkdir -p $(dir $(PTRACE_DIR))
+	git clone --depth 1 $(PTRACE_REPO) $(PTRACE_DIR)
+
+$(PTRACE): $(PTRACE_CHECKOUT) $(wildcard $(PTRACE_DIR)/src/* $(PTRACE_DIR)/source/*)
+	$(MAKE) -C $(PTRACE_DIR) PLATFORM=$(PLATFORM) all
+
+$(OBJ_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+format:
+	clang-format -i $(wildcard source/*/*.c headers/*/*.h)
