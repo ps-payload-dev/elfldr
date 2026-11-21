@@ -745,7 +745,10 @@ elfldr_rfork_entry(void *argv) {
 pid_t
 elfldr_spawn(const char *cwd, int stdio, char *const argv[],
              char *const envp[], const uint8_t *elf, size_t elf_size) {
+  uint8_t int3instr = 0xcc;
   struct kevent evt;
+  intptr_t brkpoint;
+  uint8_t orginstr;
   void *stack;
   pid_t pid;
   int kq;
@@ -834,6 +837,40 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
 
   if(elfldr_set_heap_size(pid, -1)) {
     LOG_PT_PERROR(pid, "pt_dynlib_process_needed_and_relocate");
+  }
+
+  if(!(brkpoint = kernel_dynlib_entry_addr(pid, 0))) {
+    LOG_PUTS("kernel_dynlib_entry_addr failed");
+    pt_detach(pid, SIGKILL);
+    return -1;
+  }
+  brkpoint += 58;
+
+  if(pt_copyout(pid, brkpoint, &orginstr, sizeof(orginstr))) {
+    LOG_PT_PERROR(pid, "pt_copyout");
+    pt_detach(pid, SIGKILL);
+    return -1;
+  }
+  if(pt_copyin(pid, &int3instr, brkpoint, sizeof(int3instr))) {
+    LOG_PT_PERROR(pid, "pt_copyin");
+    pt_detach(pid, SIGKILL);
+    return -1;
+  }
+
+  if(pt_continue(pid, SIGCONT)) {
+    LOG_PT_PERROR(pid, "pt_continue");
+    pt_detach(pid, SIGKILL);
+    return -1;
+  }
+  if(waitpid(pid, 0, 0) == -1) {
+    LOG_PERROR("waitpid");
+    pt_detach(pid, SIGKILL);
+    return -1;
+  }
+  if(pt_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {
+    LOG_PT_PERROR(pid, "pt_copyin");
+    pt_detach(pid, SIGKILL);
+    return -1;
   }
 
   if(elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "Payload")) {
