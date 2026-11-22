@@ -19,6 +19,7 @@ along with this program; see the file COPYING. If not, see
 
 #include <elf.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -617,6 +618,17 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
+  char old_cwd[PATH_MAX];
+  const int have_cwd = getcwd(old_cwd, sizeof(old_cwd)) != NULL;
+  const int move_cwd = cwd && (!have_cwd || strcmp(old_cwd, cwd));
+
+  if(move_cwd && chdir(cwd)) {
+    LOG_PERROR("chdir");
+    mem_free(stack);
+    close(kq);
+    return -1;
+  }
+
   if((pid = rfork_thread(RFPROC | RFCFDG | RFMEM, stack + PAGE_SIZE - 8,
                          elfldr_rfork_entry, (void *)argv))
      < 0) {
@@ -624,6 +636,10 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     mem_free(stack);
     close(kq);
     return -1;
+  }
+
+  if(move_cwd && have_cwd) {
+    chdir(old_cwd);
   }
 
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC, 0, 0);
@@ -685,7 +701,7 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   }
 
   elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "payload.elf");
-  if(elfldr_set_environ(pid, envp) || elfldr_set_cwd(pid, cwd)) {
+  if(elfldr_set_environ(pid, envp)) {
     pt_detach(pid, SIGKILL);
     return -1;
   }
