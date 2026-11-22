@@ -684,7 +684,7 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
-  elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "Payload");
+  elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "payload.elf");
   if(elfldr_set_environ(pid, envp) || elfldr_set_cwd(pid, cwd)) {
     pt_detach(pid, SIGKILL);
     return -1;

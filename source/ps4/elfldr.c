@@ -38,7 +38,6 @@ along with this program; see the file COPYING. If not, see
 #include <ps4/kernel.h>
 #include <ps4/klog.h>
 
-#include "sysmodule_ids.h"
 
 #include "elfldr.h"
 #include "log.h"
@@ -236,45 +235,12 @@ elfldr_load_needed_modules(pid_t pid, const uint8_t *elf) {
   const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)elf;
   const Elf64_Shdr *shdr = (const Elf64_Shdr *)(elf + ehdr->e_shoff);
   intptr_t load_start;
-  intptr_t load_sysmodule;
-  unsigned int sysmodule_handle;
 
   load_start = pt_resolve(pid, "sceKernelLoadStartModule");
   if(!load_start) {
     LOG_PUTS("elfldr: cannot resolve sceKernelLoadStartModule");
     return -1;
   }
-  load_sysmodule = 0;
-  if(kernel_dynlib_handle(pid, "libSceSysmodule.sprx", &sysmodule_handle)) {
-    const char sysmodule_path[] = "/system/common/lib/libSceSysmodule.sprx";
-    intptr_t remote_path = pt_mmap(pid, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
-                                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if(remote_path != -1
-       && !pt_copyin(pid, sysmodule_path, remote_path,
-                     sizeof(sysmodule_path))) {
-      uint64_t args[6] = { (uint64_t)remote_path };
-      intptr_t result = -1;
-      int call_error = pt_call(pid, load_start, args, &result);
-      if(call_error || (int32_t)result <= 0) {
-        LOG_PRINTF(
-            "elfldr: load libSceSysmodule.sprx failed result=0x%08x call=%d\n",
-            (unsigned int)(int32_t)result, call_error);
-      }
-      pt_munmap(pid, remote_path, PAGE_SIZE);
-    } else {
-      LOG_PUTS("elfldr: cannot allocate path for libSceSysmodule.sprx");
-      if(remote_path != -1)
-        pt_munmap(pid, remote_path, PAGE_SIZE);
-    }
-  }
-  if(!kernel_dynlib_handle(pid, "libSceSysmodule.sprx", &sysmodule_handle)) {
-    load_sysmodule = kernel_dynlib_dlsym(pid, sysmodule_handle,
-                                         "sceSysmoduleLoadModuleInternal");
-  }
-  if(!load_sysmodule) {
-    LOG_PUTS("elfldr: cannot resolve sceSysmoduleLoadModuleInternal");
-  }
-
   for(size_t i = 0; i < ehdr->e_shnum; ++i) {
     const Elf64_Shdr *strhdr;
     const Elf64_Dyn *dyn;
@@ -297,28 +263,6 @@ elfldr_load_needed_modules(pid_t pid, const uint8_t *elf) {
       const char *name = strtab + dyn[j].d_un.d_val;
       if(!kernel_dynlib_handle(pid, name, &handle)) {
         continue;
-      }
-
-      unsigned int sysmodule = 0;
-      for(size_t m = 0; m < sizeof(sysmodule_internal_table)
-                                / sizeof(sysmodule_internal_table[0]);
-          ++m) {
-        if(!strcmp(name, sysmodule_internal_table[m].name)) {
-          sysmodule = sysmodule_internal_table[m].id;
-          break;
-        }
-      }
-      if(sysmodule && load_sysmodule) {
-        uint64_t sysmodule_args[6] = { sysmodule };
-        intptr_t sysmodule_result = -1;
-        int call_error
-            = pt_call(pid, load_sysmodule, sysmodule_args, &sysmodule_result);
-        if(call_error || (int32_t)sysmodule_result < 0) {
-          LOG_PRINTF(
-              "elfldr: sysmodule %s id=0x%08x failed result=0x%08x call=%d\n",
-              name, sysmodule, (unsigned int)(int32_t)sysmodule_result,
-              call_error);
-        }
       }
 
       if(!elfldr_load_module_needs(pid, load_start, name)) {
@@ -919,7 +863,7 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
-  if(elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "Payload")) {
+  if(elfldr_set_procname(pid, argv && argv[0] ? argv[0] : "payload.elf")) {
     LOG_PRINTF("elfldr_spawn: set process name failed pid=%d errno=%d\n", pid,
                errno);
   }
