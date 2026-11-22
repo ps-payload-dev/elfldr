@@ -19,7 +19,9 @@ along with this program; see the file COPYING. If not, see
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <sys/thr.h>
+#include <unistd.h>
 
 #include <ps4/kernel.h>
 #include <ptrace.h>
@@ -33,8 +35,22 @@ INCASSET(socksrv_elf, "build/ps4/objects/socksrv.elf");
 
 static char *const argv[] = { "elfldr.elf", 0 };
 
+static void
+get_thread_name(char name[32]) {
+  int mib[4] = { 1, 14, 1, getpid() };
+  uint8_t info[2048];
+  size_t size = sizeof(info);
+
+  name[0] = 0;
+  if(!sysctl(mib, 4, info, &size, 0, 0) && size > 447) {
+    strncpy(name, (const char *)&info[447], 31);
+    name[31] = 0;
+  }
+}
+
 int
 main(void) {
+  char thread_name[32];
   unsigned char privcaps[16]
       = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
           0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -45,6 +61,7 @@ main(void) {
   uint8_t qaflags[16];
   int err;
 
+  get_thread_name(thread_name);
   thr_set_name(-1, "elfldr.elf");
   LOG_PUTS("Bootstrapping elfldr.elf...");
 
@@ -110,6 +127,9 @@ main(void) {
   if(kernel_set_proc_jaildir(-1, jaildir)) {
     LOG_PUTS("kernel_set_proc_jaildir failed");
     err = -1;
+  }
+  if(thread_name[0]) {
+    thr_set_name(-1, thread_name);
   }
 
   return err;

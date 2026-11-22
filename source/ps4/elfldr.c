@@ -37,7 +37,6 @@ along with this program; see the file COPYING. If not, see
 
 #include <ps4/kernel.h>
 #include <ps4/klog.h>
-#include <ps4/mdbg.h>
 
 #include "sysmodule_ids.h"
 
@@ -153,11 +152,87 @@ elfldr_relocate_symbol(elfldr_ctx_t *ctx, const Elf64_Shdr *shdr, size_t shnum,
   return 0;
 }
 
+static const char *const elfldr_libdirs[]
+    = { "/system/priv/lib", "/system/common/lib", "/system_ex/priv_ex/lib",
+        "/system_ex/common_ex/lib" };
+
+static const struct {
+  const char *module;
+  const char *needs[2];
+} elfldr_module_needs[] = {
+  { "libSceSystemService.sprx", { "libSceIpmi.sprx", "libSceRegMgr.sprx" } },
+  { "libSceUserService.sprx", { "libSceIpmi.sprx", "libSceRegMgr.sprx" } },
+};
+
+static int
+elfldr_load_module(pid_t pid, intptr_t load_start, const char *name) {
+  for(size_t d = 0; d < sizeof(elfldr_libdirs) / sizeof(elfldr_libdirs[0]);
+      ++d) {
+    char path[PATH_MAX];
+    intptr_t remote_path;
+    intptr_t result = -1;
+    uint64_t args[6] = { 0 };
+
+    if(snprintf(path, sizeof(path), "%s/%s", elfldr_libdirs[d], name)
+       >= sizeof(path)) {
+      errno = ENAMETOOLONG;
+      return -1;
+    }
+    if(access(path, F_OK)) {
+      continue;
+    }
+    remote_path = pt_mmap(pid, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
+                          MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if(remote_path == -1) {
+      LOG_PT_PERROR(pid, "map module path");
+      return -1;
+    }
+    if(pt_copyin(pid, path, remote_path, strlen(path) + 1)) {
+      LOG_PT_PERROR(pid, "copy module path");
+      pt_munmap(pid, remote_path, PAGE_SIZE);
+      return -1;
+    }
+    args[0] = (uint64_t)remote_path;
+    int call_error = pt_call(pid, load_start, args, &result);
+    pt_munmap(pid, remote_path, PAGE_SIZE);
+    if(!call_error && (int32_t)result > 0) {
+      return 0;
+    }
+    LOG_PRINTF("elfldr: load dependency %s from %s failed result=0x%08x\n",
+               name, path, (unsigned int)(int32_t)result);
+  }
+
+  return -1;
+}
+
+static int
+elfldr_load_module_needs(pid_t pid, intptr_t load_start, const char *name) {
+  for(size_t m = 0;
+      m < sizeof(elfldr_module_needs) / sizeof(elfldr_module_needs[0]); ++m) {
+    if(strcmp(name, elfldr_module_needs[m].module)) {
+      continue;
+    }
+    for(size_t n = 0; n < 2 && elfldr_module_needs[m].needs[n]; ++n) {
+      unsigned int handle;
+
+      if(!kernel_dynlib_handle(pid, elfldr_module_needs[m].needs[n],
+                               &handle)) {
+        continue;
+      }
+      if(elfldr_load_module(pid, load_start,
+                            elfldr_module_needs[m].needs[n])) {
+        LOG_PRINTF("elfldr: unable to load %s needed by %s\n",
+                   elfldr_module_needs[m].needs[n], name);
+        return -1;
+      }
+    }
+  }
+
+  return 0;
+}
+
 static int
 elfldr_load_needed_modules(pid_t pid, const uint8_t *elf) {
-  static const char *const libdirs[]
-      = { "/system/priv/lib", "/system/common/lib", "/system_ex/priv_ex/lib",
-          "/system_ex/common_ex/lib" };
   const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)elf;
   const Elf64_Shdr *shdr = (const Elf64_Shdr *)(elf + ehdr->e_shoff);
   intptr_t load_start;
@@ -246,40 +321,8 @@ elfldr_load_needed_modules(pid_t pid, const uint8_t *elf) {
         }
       }
 
-      for(size_t d = 0; d < sizeof(libdirs) / sizeof(libdirs[0]); ++d) {
-        char path[PATH_MAX];
-        intptr_t remote_path;
-        intptr_t result = -1;
-        uint64_t args[6] = { 0 };
-
-        if(snprintf(path, sizeof(path), "%s/%s", libdirs[d], name)
-           >= sizeof(path)) {
-          errno = ENAMETOOLONG;
-          return -1;
-        }
-        if(access(path, F_OK)) {
-          continue;
-        }
-        remote_path = pt_mmap(pid, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
-                              MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-        if(remote_path == -1) {
-          LOG_PT_PERROR(pid, "map module path");
-          return -1;
-        }
-        if(pt_copyin(pid, path, remote_path, strlen(path) + 1)) {
-          LOG_PT_PERROR(pid, "copy module path");
-          pt_munmap(pid, remote_path, PAGE_SIZE);
-          return -1;
-        }
-        args[0] = (uint64_t)remote_path;
-        int call_error = pt_call(pid, load_start, args, &result);
-        pt_munmap(pid, remote_path, PAGE_SIZE);
-        if(!call_error && (int32_t)result > 0) {
-          loaded = 1;
-          break;
-        }
-        LOG_PRINTF("elfldr: load dependency %s from %s failed result=0x%08x\n",
-                   name, path, (unsigned int)(int32_t)result);
+      if(!elfldr_load_module_needs(pid, load_start, name)) {
+        loaded = !elfldr_load_module(pid, load_start, name);
       }
       if(!loaded) {
         LOG_PRINTF("elfldr: unable to load dependency %s\n", name);
@@ -386,8 +429,8 @@ elfldr_load(pid_t pid, const uint8_t *elf) {
     }
   }
 
-  if(mdbg_copyin(ctx.pid, ctx.base_mirror, ctx.base_addr, ctx.base_size)) {
-    LOG_PERROR("mdbg_copyin");
+  if(pt_copyin(ctx.pid, ctx.base_mirror, ctx.base_addr, ctx.base_size)) {
+    LOG_PERROR("pt_copyin");
     error = 1;
   }
 
@@ -546,28 +589,28 @@ elfldr_set_heap_size(pid_t pid, ssize_t size) {
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
-  if(!(sceProcParam = mdbg_getlong(pid, buf))) {
-    LOG_PERROR("mdbg_getlong");
+  if(!(sceProcParam = pt_getlong(pid, buf))) {
+    LOG_PERROR("pt_getlong");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_copyout(pid, sceProcParam + 56, &sceLibcParam,
+  if(pt_copyout(pid, sceProcParam + 56, &sceLibcParam,
                   sizeof(sceLibcParam))) {
-    LOG_PERROR("mdbg_copyout");
+    LOG_PERROR("pt_copyout");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_copyout(pid, sceLibcParam + 16, &sceLibcHeapSize,
+  if(pt_copyout(pid, sceLibcParam + 16, &sceLibcHeapSize,
                   sizeof(sceLibcHeapSize))) {
-    LOG_PERROR("mdbg_copyout");
+    LOG_PERROR("pt_copyout");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_setint(pid, sceLibcHeapSize, size)) {
-    LOG_PERROR("mdbg_setint");
+  if(pt_setint(pid, sceLibcHeapSize, size)) {
+    LOG_PERROR("pt_setint");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
@@ -578,14 +621,14 @@ elfldr_set_heap_size(pid_t pid, ssize_t size) {
   }
 
   sceLibcHeapExtendedAlloc = buf;
-  if(mdbg_setlong(pid, sceLibcParam + 32, sceLibcHeapExtendedAlloc)) {
-    LOG_PERROR("mdbg_setlong");
+  if(pt_setlong(pid, sceLibcParam + 32, sceLibcHeapExtendedAlloc)) {
+    LOG_PERROR("pt_setlong");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
 
-  if(mdbg_setint(pid, sceLibcHeapExtendedAlloc, 1)) {
-    LOG_PERROR("mdbg_setint");
+  if(pt_setint(pid, sceLibcHeapExtendedAlloc, 1)) {
+    LOG_PERROR("pt_setint");
     pt_munmap(pid, buf, PAGE_SIZE);
     return -1;
   }
@@ -604,7 +647,7 @@ elfldr_set_procname(pid_t pid, const char *name) {
     return -1;
   }
 
-  mdbg_copyin(pid, name, buf, strlen(name) + 1);
+  pt_copyin(pid, name, buf, strlen(name) + 1);
 
   pt_syscall(pid, SYS_thr_set_name, (uint64_t)-1, (uint64_t)buf, 0ULL, 0ULL,
              0ULL, 0ULL);
@@ -731,6 +774,11 @@ elfldr_rfork_entry(void *argv) {
     return 0;
   }
 
+  if(ptrace(PT_TRACE_ME, 0, 0, 0)) {
+    LOG_PERROR("ptrace");
+    return 0;
+  }
+
   sp.sched_priority = sched_get_priority_min(SCHED_RR);
   if(sched_setscheduler(0, SCHED_RR, &sp)) {
     LOG_PERROR("sched_setscheduler");
@@ -817,13 +865,6 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     close(kq);
     return -1;
   }
-  if(elfldr_raise_privileges(pid)) {
-    LOG_PERROR("elfldr_raise_privileges");
-    pt_detach(pid, SIGKILL);
-    mem_free(stack);
-    close(kq);
-    return -1;
-  }
 
   mem_free(stack);
   close(kq);
@@ -869,6 +910,11 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   }
   if(pt_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {
     LOG_PT_PERROR(pid, "pt_copyin");
+    pt_detach(pid, SIGKILL);
+    return -1;
+  }
+  if(elfldr_raise_privileges(pid)) {
+    LOG_PUTS("elfldr_raise_privileges failed");
     pt_detach(pid, SIGKILL);
     return -1;
   }

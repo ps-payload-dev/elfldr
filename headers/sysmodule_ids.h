@@ -19,46 +19,33 @@ along with this program; see the file COPYING. If not, see
 
 #include <stdint.h>
 
-/**
- * The internal sysmodule ids of the PS4 (sceSysmoduleLoadModuleInternal).
- *
- * This file is identical in binldr and elfldr, change it in both. The ids come
- * from psdevwiki ("Internal sysmodule libraries") and OpenOrbis, and the
- * entries that the loaders rely on have been checked against both.
- *
- * Do not add libSceHttp2 or libSceSsl2, they cause problems on some firmwares.
- **/
-typedef enum binldr_sysmodule_id {
-  BINLDR_SYSMODULE_INTERNAL_AUDIO_OUT = 0x80000001,
-  BINLDR_SYSMODULE_INTERNAL_SYSTEM_SERVICE = 0x80000010,
-  BINLDR_SYSMODULE_INTERNAL_VIDEO_OUT = 0x80000022,
-  BINLDR_SYSMODULE_INTERNAL_NET = 0x8000001c,
-  BINLDR_SYSMODULE_INTERNAL_USER_SERVICE = 0x80000011,
-  BINLDR_SYSMODULE_INTERNAL_PAD = 0x80000024,
-  BINLDR_SYSMODULE_INTERNAL_SYS_UTIL = 0x80000026,
-  BINLDR_SYSMODULE_INTERNAL_GNM_DRIVER = 0x80000052,
-  BINLDR_SYSMODULE_INTERNAL_NET_CTL = 0x80000009,
-  BINLDR_SYSMODULE_INTERNAL_HTTP = 0x8000000a,
-  BINLDR_SYSMODULE_INTERNAL_SSL = 0x8000000b,
-} binldr_sysmodule_id_t;
+typedef enum sysmodule_id {
+  SYSMODULE_INTERNAL_AUDIO_OUT = 0x80000001,
+  SYSMODULE_INTERNAL_SYSTEM_SERVICE = 0x80000010,
+  SYSMODULE_INTERNAL_VIDEO_OUT = 0x80000022,
+  SYSMODULE_INTERNAL_NET = 0x8000001c,
+  SYSMODULE_INTERNAL_USER_SERVICE = 0x80000011,
+  SYSMODULE_INTERNAL_PAD = 0x80000024,
+  SYSMODULE_INTERNAL_SYS_UTIL = 0x80000026,
+  SYSMODULE_INTERNAL_GNM_DRIVER = 0x80000052,
+  SYSMODULE_INTERNAL_NET_CTL = 0x80000009,
+  SYSMODULE_INTERNAL_HTTP = 0x8000000a,
+  SYSMODULE_INTERNAL_SSL = 0x8000000b,
+} sysmodule_id_t;
 
-typedef enum binldr_public_sysmodule_id {
-  BINLDR_SYSMODULE_MESSAGE_DIALOG = 0x00a4,
-  BINLDR_SYSMODULE_IME_DIALOG = 0x0096,
-  BINLDR_SYSMODULE_SAVE_DATA_DIALOG = 0x00a0,
-  BINLDR_SYSMODULE_APP_CONTENT = 0x00b4,
-  BINLDR_SYSMODULE_NP_TROPHY = 0x00ad,
-} binldr_public_sysmodule_id_t;
+typedef enum sysmodule_public_id {
+  SYSMODULE_MESSAGE_DIALOG = 0x00a4,
+  SYSMODULE_IME_DIALOG = 0x0096,
+  SYSMODULE_SAVE_DATA_DIALOG = 0x00a0,
+  SYSMODULE_APP_CONTENT = 0x00b4,
+  SYSMODULE_NP_TROPHY = 0x00ad,
+} sysmodule_public_id_t;
 
 typedef struct sysmodule_entry {
   const char *name;
   uint32_t id;
 } sysmodule_entry_t;
 
-/**
- * Library name to internal sysmodule id, for loaders that start from the
- * dependencies of an ELF (elfldr).
- **/
 static const sysmodule_entry_t sysmodule_internal_table[]
     __attribute__((unused)) = {
       { "libSceAudioOut.sprx", 0x80000001 },
