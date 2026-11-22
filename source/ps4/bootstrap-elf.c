@@ -62,7 +62,7 @@ main(void) {
   int err;
 
   get_thread_name(thread_name);
-  thr_set_name(-1, "elfldr.elf");
+  thr_set_name(-1, "elfldr bootstrap");
   LOG_PUTS("Bootstrapping elfldr.elf...");
 
   if(patch_ps4_ptrace()) {

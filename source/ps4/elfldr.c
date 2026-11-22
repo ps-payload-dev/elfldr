@@ -18,6 +18,7 @@ along with this program; see the file COPYING. If not, see
 #define ELFLDR_IMPLEMENTATION
 
 #include <elf.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -45,6 +46,7 @@ along with this program; see the file COPYING. If not, see
 #include <ptrace.h>
 
 #define MB(x) (x * 0x100000)
+#define SPAWN_TIMEOUT_MS 10000
 #define ROUND_PG(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 #define TRUNC_PG(x) ((x) & ~(PAGE_SIZE - 1))
 #define PFLAGS(x)                                                             \
@@ -603,9 +605,34 @@ elfldr_rfork_entry(void *argv) {
   return 0;
 }
 
+static int
+elfldr_wait_stopped(pid_t pid) {
+  for(int waited = 0; waited < SPAWN_TIMEOUT_MS; waited += 10) {
+    pid_t result = waitpid(pid, 0, WNOHANG);
+
+    if(result == pid) {
+      return 0;
+    }
+    if(result < 0 && errno != EINTR) {
+      LOG_PERROR("waitpid");
+      pt_detach(pid, SIGKILL);
+      return -1;
+    }
+    usleep(10000);
+  }
+
+  LOG_PRINTF("elfldr_spawn: pid %d did not reach its entry in time; killed\n",
+             pid);
+  kill(pid, SIGKILL);
+  while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
+  }
+  return -1;
+}
+
 pid_t
 elfldr_spawn(const char *cwd, int stdio, char *const argv[],
              char *const envp[], const uint8_t *elf, size_t elf_size) {
+  const struct timespec spawn_timeout = { SPAWN_TIMEOUT_MS / 1000, 0 };
   uint8_t int3instr = 0xcc;
   struct kevent evt;
   intptr_t brkpoint;
@@ -646,8 +673,8 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   }
 
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC | NOTE_EXIT, 0, 0);
-  if(kevent(kq, &evt, 1, &evt, 1, 0) < 0) {
-    LOG_PERROR("kevent");
+  if(kevent(kq, &evt, 1, &evt, 1, &spawn_timeout) <= 0) {
+    LOG_PRINTF("elfldr_spawn: pid %d did not exec in time\n", pid);
     kill(pid, SIGKILL);
     while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
     }
@@ -723,9 +750,7 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     pt_detach(pid, SIGKILL);
     return -1;
   }
-  if(waitpid(pid, 0, 0) == -1) {
-    LOG_PERROR("waitpid");
-    pt_detach(pid, SIGKILL);
+  if(elfldr_wait_stopped(pid)) {
     return -1;
   }
   if(pt_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {

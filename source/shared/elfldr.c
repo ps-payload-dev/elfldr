@@ -263,7 +263,6 @@ pid_t
 elfldr_find_pid(const char *name) {
   int mib[4] = { 1, 14, 8, 0 };
   pid_t mypid = getpid();
-  pid_t parent = getppid();
   pid_t pid = -1;
   size_t buf_size;
   uint8_t *buf;
@@ -290,7 +289,7 @@ elfldr_find_pid(const char *name) {
     char *ki_tdname = (char *)&ptr[447];
 
     ptr += ki_structsize;
-    if(!strcmp(name, ki_tdname) && ki_pid != mypid && ki_pid != parent) {
+    if(!strcmp(name, ki_tdname) && ki_pid != mypid) {
       pid = ki_pid;
     }
   }
