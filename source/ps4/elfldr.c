@@ -123,13 +123,13 @@ elfldr_relocate_symbol(elfldr_ctx_t *ctx, const Elf64_Shdr *shdr, size_t shnum,
     }
   }
 
-  if(!address || rela->r_offset < ctx->min_vaddr
-     || ctx->base_size < sizeof(address)
+  if(rela->r_offset < ctx->min_vaddr || ctx->base_size < sizeof(address)
      || rela->r_offset - ctx->min_vaddr > ctx->base_size - sizeof(address)) {
-    LOG_PRINTF("elfldr_load: cannot resolve symbol %s\n",
-               symstr + sym->st_name);
-    errno = ENOENT;
+    errno = ENOEXEC;
     return -1;
+  }
+  if(!address) {
+    return 0;
   }
 
   unsigned long *location
@@ -146,133 +146,6 @@ elfldr_relocate_symbol(elfldr_ctx_t *ctx, const Elf64_Shdr *shdr, size_t shnum,
     default:
       errno = ENOTSUP;
       return -1;
-  }
-
-  return 0;
-}
-
-static const char *const elfldr_libdirs[]
-    = { "/system/priv/lib", "/system/common/lib", "/system_ex/priv_ex/lib",
-        "/system_ex/common_ex/lib" };
-
-static const struct {
-  const char *module;
-  const char *needs[2];
-} elfldr_module_needs[] = {
-  { "libSceSystemService.sprx", { "libSceIpmi.sprx", "libSceRegMgr.sprx" } },
-  { "libSceUserService.sprx", { "libSceIpmi.sprx", "libSceRegMgr.sprx" } },
-};
-
-static int
-elfldr_load_module(pid_t pid, intptr_t load_start, const char *name) {
-  for(size_t d = 0; d < sizeof(elfldr_libdirs) / sizeof(elfldr_libdirs[0]);
-      ++d) {
-    char path[PATH_MAX];
-    intptr_t remote_path;
-    intptr_t result = -1;
-    uint64_t args[6] = { 0 };
-
-    if(snprintf(path, sizeof(path), "%s/%s", elfldr_libdirs[d], name)
-       >= sizeof(path)) {
-      errno = ENAMETOOLONG;
-      return -1;
-    }
-    if(access(path, F_OK)) {
-      continue;
-    }
-    remote_path = pt_mmap(pid, 0, PAGE_SIZE, PROT_READ | PROT_WRITE,
-                          MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if(remote_path == -1) {
-      LOG_PT_PERROR(pid, "map module path");
-      return -1;
-    }
-    if(pt_copyin(pid, path, remote_path, strlen(path) + 1)) {
-      LOG_PT_PERROR(pid, "copy module path");
-      pt_munmap(pid, remote_path, PAGE_SIZE);
-      return -1;
-    }
-    args[0] = (uint64_t)remote_path;
-    int call_error = pt_call(pid, load_start, args, &result);
-    pt_munmap(pid, remote_path, PAGE_SIZE);
-    if(!call_error && (int32_t)result > 0) {
-      return 0;
-    }
-    LOG_PRINTF("elfldr: load dependency %s from %s failed result=0x%08x\n",
-               name, path, (unsigned int)(int32_t)result);
-  }
-
-  return -1;
-}
-
-static int
-elfldr_load_module_needs(pid_t pid, intptr_t load_start, const char *name) {
-  for(size_t m = 0;
-      m < sizeof(elfldr_module_needs) / sizeof(elfldr_module_needs[0]); ++m) {
-    if(strcmp(name, elfldr_module_needs[m].module)) {
-      continue;
-    }
-    for(size_t n = 0; n < 2 && elfldr_module_needs[m].needs[n]; ++n) {
-      unsigned int handle;
-
-      if(!kernel_dynlib_handle(pid, elfldr_module_needs[m].needs[n],
-                               &handle)) {
-        continue;
-      }
-      if(elfldr_load_module(pid, load_start,
-                            elfldr_module_needs[m].needs[n])) {
-        LOG_PRINTF("elfldr: unable to load %s needed by %s\n",
-                   elfldr_module_needs[m].needs[n], name);
-        return -1;
-      }
-    }
-  }
-
-  return 0;
-}
-
-static int
-elfldr_load_needed_modules(pid_t pid, const uint8_t *elf) {
-  const Elf64_Ehdr *ehdr = (const Elf64_Ehdr *)elf;
-  const Elf64_Shdr *shdr = (const Elf64_Shdr *)(elf + ehdr->e_shoff);
-  intptr_t load_start;
-
-  load_start = pt_resolve(pid, "sceKernelLoadStartModule");
-  if(!load_start) {
-    LOG_PUTS("elfldr: cannot resolve sceKernelLoadStartModule");
-    return -1;
-  }
-  for(size_t i = 0; i < ehdr->e_shnum; ++i) {
-    const Elf64_Shdr *strhdr;
-    const Elf64_Dyn *dyn;
-    const char *strtab;
-
-    if(shdr[i].sh_type != SHT_DYNAMIC || shdr[i].sh_link >= ehdr->e_shnum) {
-      continue;
-    }
-    strhdr = &shdr[shdr[i].sh_link];
-    strtab = (const char *)(elf + strhdr->sh_offset);
-    dyn = (const Elf64_Dyn *)(elf + shdr[i].sh_offset);
-
-    for(size_t j = 0; j < shdr[i].sh_size / sizeof(*dyn); ++j) {
-      unsigned int handle;
-      int loaded = 0;
-
-      if(dyn[j].d_tag != DT_NEEDED || dyn[j].d_un.d_val >= strhdr->sh_size) {
-        continue;
-      }
-      const char *name = strtab + dyn[j].d_un.d_val;
-      if(!kernel_dynlib_handle(pid, name, &handle)) {
-        continue;
-      }
-
-      if(!elfldr_load_module_needs(pid, load_start, name)) {
-        loaded = !elfldr_load_module(pid, load_start, name);
-      }
-      if(!loaded) {
-        LOG_PRINTF("elfldr: unable to load dependency %s\n", name);
-        return -1;
-      }
-    }
   }
 
   return 0;
@@ -417,10 +290,6 @@ elfldr_prepare_exec(pid_t pid, const uint8_t *elf) {
     return -1;
   }
 
-  if(elfldr_load_needed_modules(pid, elf)) {
-    LOG_PERROR("elfldr_load_needed_modules");
-    return -1;
-  }
   if(!(entry = elfldr_load(pid, elf))) {
     LOG_PUTS("elfldr_load failed");
     return -1;
@@ -809,6 +678,13 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     close(kq);
     return -1;
   }
+  if(elfldr_raise_privileges(pid)) {
+    LOG_PERROR("elfldr_raise_privileges");
+    pt_detach(pid, SIGKILL);
+    mem_free(stack);
+    close(kq);
+    return -1;
+  }
 
   mem_free(stack);
   close(kq);
@@ -854,11 +730,6 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   }
   if(pt_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {
     LOG_PT_PERROR(pid, "pt_copyin");
-    pt_detach(pid, SIGKILL);
-    return -1;
-  }
-  if(elfldr_raise_privileges(pid)) {
-    LOG_PUTS("elfldr_raise_privileges failed");
     pt_detach(pid, SIGKILL);
     return -1;
   }
