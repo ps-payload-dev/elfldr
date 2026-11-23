@@ -18,6 +18,7 @@ along with this program; see the file COPYING. If not, see
 #include <sys/types.h>
 
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <ifaddrs.h>
 #include <limits.h>
 #include <netinet/in.h>
@@ -600,7 +601,9 @@ serve_elfldr(uint16_t port) {
 static int
 notify_address(const char *prefix, int port) {
   char ip[INET_ADDRSTRLEN] = "127.0.0.1";
+  char ifname[IFNAMSIZ] = "lo0";
   struct ifaddrs *ifaddr;
+  int found = 0;
 
   if(getifaddrs(&ifaddr) == -1) {
     LOG_PERROR("getifaddrs");
@@ -608,6 +611,9 @@ notify_address(const char *prefix, int port) {
   }
 
   for(struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+    char addr[INET_ADDRSTRLEN];
+    int preferred;
+
     if(ifa->ifa_addr == NULL) {
       continue;
     }
@@ -621,17 +627,28 @@ notify_address(const char *prefix, int port) {
     }
 
     struct sockaddr_in *in = (struct sockaddr_in *)ifa->ifa_addr;
-    inet_ntop(AF_INET, &(in->sin_addr), ip, sizeof(ip));
+    inet_ntop(AF_INET, &(in->sin_addr), addr, sizeof(addr));
 
-    if(!strncmp("0.", ip, 2)) {
+    if(!strncmp("0.", addr, 2)) {
       continue;
+    }
+
+    preferred
+        = !strncmp("wlan", ifa->ifa_name, 4) || !strncmp("eth", ifa->ifa_name, 3);
+    if(!found || preferred) {
+      snprintf(ip, sizeof(ip), "%s", addr);
+      snprintf(ifname, sizeof(ifname), "%s", ifa->ifa_name);
+      found = 1;
+      if(preferred) {
+        break;
+      }
     }
   }
 
   freeifaddrs(ifaddr);
 
-  notify("%s %s:%d", prefix, ip, port);
-  LOG_PRINTF("%s %s:%d\n", prefix, ip, port);
+  notify("%s %s:%d (%s)", prefix, ip, port, ifname);
+  LOG_PRINTF("%s %s:%d (%s)\n", prefix, ip, port, ifname);
 
   return 0;
 }
