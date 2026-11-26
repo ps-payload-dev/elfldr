@@ -669,7 +669,7 @@ elfldr_stop_after_exec(pid_t pid) {
     if(!pt_attach(pid)) {
       return 0;
     }
-    if(errno != EBUSY) {
+    if(errno != EBUSY && errno != EALREADY) {
       return -1;
     }
 
