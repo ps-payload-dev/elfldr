@@ -109,7 +109,7 @@ main(void) {
 
   if(!err) {
     signal(SIGCHLD, SIG_IGN);
-    err = elfldr_spawn(-1, argv, socksrv_elf, socksrv_elf_size);
+    err = elfldr_spawn(-1, argv, socksrv_elf, socksrv_elf_size) < 0 ? -1 : 0;
   }
 
   if(kernel_set_ucred_caps(-1, caps)) {

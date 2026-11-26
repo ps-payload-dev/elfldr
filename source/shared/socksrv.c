@@ -22,6 +22,7 @@ along with this program; see the file COPYING. If not, see
 #include <ifaddrs.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -94,6 +95,7 @@ static int
 args_split(const char *args, char **argv, size_t size) {
   char *buf = mem_strdup(args);
   size_t len;
+  int in_token = 0;
   int escape = 0;
   int argc = 0;
 
@@ -103,28 +105,21 @@ args_split(const char *args, char **argv, size_t size) {
   }
   len = strlen(buf);
   for(int i = 0; i < len && argc < size; i++) {
+    if(!escape && buf[i] == ' ') {
+      buf[i] = 0;
+      in_token = 0;
+      continue;
+    }
+
+    if(!in_token) {
+      argv[argc++] = buf + i;
+      in_token = 1;
+    }
+
     if(escape) {
       escape = 0;
-      continue;
-    }
-
-    if(buf[i] == '\\') {
+    } else if(buf[i] == '\\') {
       escape = 1;
-      continue;
-    }
-
-    if(buf[i] == ' ') {
-      buf[i] = 0;
-      continue;
-    }
-
-    if(buf[i] && !i) {
-      argv[argc++] = buf + i;
-      continue;
-    }
-
-    if(buf[i] && !buf[i - 1]) {
-      argv[argc++] = buf + i;
     }
   }
 
@@ -366,7 +361,7 @@ payload_readpost(int fd, char *uri, size_t size, uint8_t **payload,
     return http_error(fd, "431 Request Header Fields Too Large", EMSGSIZE);
   }
 
-  if(memcmp(buf, "POST /", 6)) {
+  if(memcmp(buf, "POST /", 6) || strlen(buf) != n) {
     return http_error(fd, "400 Bad Request", EINVAL);
   }
 
@@ -445,6 +440,31 @@ recv_timeout(int fd, time_t seconds) {
   }
 }
 
+static pthread_mutex_t work_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+locked_uri_get_content(const char *uri, uint8_t **buf, size_t *len) {
+  int ret;
+
+  pthread_mutex_lock(&work_lock);
+  ret = uri_get_content(uri, buf, len);
+  pthread_mutex_unlock(&work_lock);
+
+  return ret;
+}
+
+static pid_t
+locked_payload_spawn(char *filename, char *args, int stdio, uint8_t *buf,
+                     size_t len) {
+  pid_t pid;
+
+  pthread_mutex_lock(&work_lock);
+  pid = payload_spawn(filename, args, stdio, buf, len);
+  pthread_mutex_unlock(&work_lock);
+
+  return pid;
+}
+
 static void
 on_connection(int fd) {
   char *filename = "payload.elf";
@@ -467,6 +487,11 @@ on_connection(int fd) {
 
   if((n = recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_WAITALL))
      != sizeof(magic)) {
+    if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      LOG_PRINTF("[elfldr.elf] client sent no data within %d s, closing\n",
+                 RECV_TIMEOUT);
+      return;
+    }
     if(n < 0) {
       LOG_PERROR("recv");
     }
@@ -476,14 +501,14 @@ on_connection(int fd) {
 
   if(magic == PAYLOAD_MAGIC_URI_FILE || magic == PAYLOAD_MAGIC_URI_HTTP) {
     if(payload_readuri(fd, uri, PATH_MAX)
-       || uri_get_content(uri, &buf, &len)) {
+       || locked_uri_get_content(uri, &buf, &len)) {
       LOG_PERROR("payload_readuri");
       write(fd, "[elfldr.elf] Error reading URI payload\n\r\0", 41);
     }
 
   } else if(magic == PAYLOAD_MAGIC_HTTP_GET) {
     if(payload_readhttp(fd, uri, PATH_MAX)
-       || uri_get_content(uri, &buf, &len)) {
+       || locked_uri_get_content(uri, &buf, &len)) {
       LOG_PERROR("payload_readhttp");
       write(fd, "[elfldr.elf] Error reading HTTP payload\n\r\0", 42);
     }
@@ -537,7 +562,7 @@ on_connection(int fd) {
       stdio = -1;
     }
 
-    if(payload_spawn(filename, args, stdio, buf, len) < 0) {
+    if(locked_payload_spawn(filename, args, stdio, buf, len) < 0) {
       write(fd, "[elfldr.elf] Error spawning payload\n\r\0", 38);
     }
     mem_free(filename);
@@ -545,6 +570,41 @@ on_connection(int fd) {
     mem_free(args);
     mem_free(buf);
   }
+}
+
+static void *
+connection_thread(void *arg) {
+  int fd = (int)(intptr_t)arg;
+
+  on_connection(fd);
+  close(fd);
+
+  return 0;
+}
+
+static int
+spawn_connection_thread(int fd) {
+  pthread_attr_t attr;
+  pthread_t trd;
+  int error;
+
+  if((error = pthread_attr_init(&attr))) {
+    errno = error;
+    return -1;
+  }
+
+  pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+  pthread_attr_setstacksize(&attr, 0x100000);
+
+  error = pthread_create(&trd, &attr, connection_thread, (void *)(intptr_t)fd);
+  pthread_attr_destroy(&attr);
+
+  if(error) {
+    errno = error;
+    return -1;
+  }
+
+  return 0;
 }
 
 static int
@@ -587,12 +647,18 @@ serve_elfldr(uint16_t port) {
   while(1) {
     socklen = sizeof(cliaddr);
     if((connfd = accept(srvfd, (struct sockaddr *)&cliaddr, &socklen)) < 0) {
+      if(errno == EINTR || errno == ECONNABORTED) {
+        continue;
+      }
       LOG_PERROR("accept");
       break;
     }
 
-    on_connection(connfd);
-    close(connfd);
+    if(spawn_connection_thread(connfd)) {
+      LOG_PERROR("pthread_create");
+      on_connection(connfd);
+      close(connfd);
+    }
   }
 
   return close(srvfd);

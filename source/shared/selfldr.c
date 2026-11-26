@@ -18,6 +18,7 @@ along with this program; see the file COPYING. If not, see
 #include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,7 +53,10 @@ typedef struct self_spawn_args {
   uint8_t *self;
   size_t self_size;
   char *const *argv;
+  volatile int go;
 } self_spawn_args_t;
+
+#define SELF_STACK_SIZE (16 * PAGE_SIZE)
 
 static int
 rdup(pid_t pid, int fd) {
@@ -76,22 +80,29 @@ selfldr_rfork_entry(void *ctx) {
   ssize_t n;
   int fd;
 
+  while(!args->go) {
+    sched_yield();
+  }
+
   if(syscall(0x23b, 0)) {
     LOG_PERROR("sys_budget_set");
     return 0;
   }
 
-  if(rdup(ppid, args->stdio) < 0) {
-    LOG_PERROR("rdup");
-    return 0;
-  }
-  if(rdup(ppid, args->stdio) < 0) {
-    LOG_PERROR("rdup");
-    return 0;
-  }
-  if(rdup(ppid, args->stdio) < 0) {
-    LOG_PERROR("rdup");
-    return 0;
+  if(args->stdio >= 0) {
+    for(int i = 0; i < 3; i++) {
+      if(rdup(ppid, args->stdio) < 0) {
+        LOG_PERROR("rdup");
+        return 0;
+      }
+    }
+  } else {
+    if(open("/dev/deci_stdin", O_RDONLY) < 0
+       || open("/dev/deci_stdout", O_WRONLY) < 0
+       || open("/dev/deci_stderr", O_WRONLY) < 0) {
+      LOG_PERROR("open");
+      return 0;
+    }
   }
 
   sprintf(path, "/user/temp/payload_%d.self", getpid());
@@ -129,8 +140,9 @@ selfldr_rfork_entry(void *ctx) {
 
 pid_t
 selfldr_spawn(int stdio, char *const argv[], uint8_t *self, size_t self_size) {
-  self_spawn_args_t args = { stdio, self, self_size, argv };
+  self_spawn_args_t args = { stdio, self, self_size, argv, 0 };
   struct kevent evt;
+  int nevents;
   void *stack;
   pid_t pid;
   int kq;
@@ -140,13 +152,13 @@ selfldr_spawn(int stdio, char *const argv[], uint8_t *self, size_t self_size) {
     return -1;
   }
 
-  if(!(stack = mem_alloc(PAGE_SIZE))) {
+  if(!(stack = mem_alloc(SELF_STACK_SIZE))) {
     LOG_PERROR("malloc");
     close(kq);
     return -1;
   }
 
-  if((pid = rfork_thread(RFPROC | RFCFDG | RFMEM, stack + PAGE_SIZE - 8,
+  if((pid = rfork_thread(RFPROC | RFCFDG | RFMEM, stack + SELF_STACK_SIZE - 8,
                          selfldr_rfork_entry, &args))
      < 0) {
     LOG_PERROR("rfork_thread");
@@ -156,8 +168,27 @@ selfldr_spawn(int stdio, char *const argv[], uint8_t *self, size_t self_size) {
   }
 
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC | NOTE_EXIT, 0, 0);
-  if(kevent(kq, &evt, 1, &evt, 1, 0) < 0) {
+  if(kevent(kq, &evt, 1, 0, 0, 0) < 0) {
     LOG_PERROR("kevent");
+    kill(pid, SIGKILL);
+    while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
+    }
+    mem_free(stack);
+    close(kq);
+    return -1;
+  }
+
+  args.go = 1;
+
+  while((nevents = kevent(kq, 0, 0, &evt, 1, 0)) < 0 && errno == EINTR) {
+  }
+  if(nevents < 0 || !(evt.fflags & NOTE_EXEC)) {
+    if(nevents < 0) {
+      LOG_PERROR("kevent");
+    } else {
+      LOG_PRINTF("selfldr_spawn: pid %d exited before exec\n", pid);
+      errno = ENOEXEC;
+    }
     kill(pid, SIGKILL);
     while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
     }

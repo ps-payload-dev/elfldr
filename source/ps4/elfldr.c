@@ -46,7 +46,6 @@ along with this program; see the file COPYING. If not, see
 #include <ptrace.h>
 
 #define MB(x) (x * 0x100000)
-#define SPAWN_TIMEOUT_MS 10000
 #define ROUND_PG(x) (((x) + (PAGE_SIZE - 1)) & ~(PAGE_SIZE - 1))
 #define TRUNC_PG(x) ((x) & ~(PAGE_SIZE - 1))
 #define PFLAGS(x)                                                             \
@@ -108,16 +107,6 @@ elfldr_relocate_symbol(elfldr_ctx_t *ctx, const Elf64_Shdr *shdr, size_t shnum,
           continue;
         }
         address = kernel_dynlib_dlsym(ctx->pid, handle, symstr + sym->st_name);
-        if(!address
-           && (!strcmp(symstr + sym->st_name, "scePadSetVibrationMode")
-               || !strcmp(symstr + sym->st_name,
-                          "sceVideoOutSetBufferAttribute2")
-               || !strcmp(symstr + sym->st_name,
-                          "sceVideoOutRegisterBuffers2"))) {
-          LOG_PRINTF("elfldr: symbol %s absent in %s handle=%u\n",
-                     symstr + sym->st_name, dynstr + dyn[j].d_un.d_val,
-                     handle);
-        }
         if(address) {
           break;
         }
@@ -233,7 +222,7 @@ elfldr_load(pid_t pid, const uint8_t *elf) {
     }
 
     const Elf64_Rela *rela = (const Elf64_Rela *)(elf + shdr[i].sh_offset);
-    for(int j = 0; j < shdr[i].sh_size / sizeof(Elf64_Rela); j++) {
+    for(int j = 0; j < shdr[i].sh_size / sizeof(Elf64_Rela) && !error; j++) {
       switch(rela[j].r_info & 0xffffffffl) {
         case R_X86_64_RELATIVE:
           error = r_relative(&ctx, &rela[j]);
@@ -362,19 +351,30 @@ elfldr_exec(pid_t pid, int stdio, const uint8_t *elf) {
   if(stdio > 0) {
     stdio = pt_rdup(pid, getpid(), stdio);
 
+    if(stdio < 0) {
+      LOG_PT_PERROR(pid, "pt_rdup");
+      pt_detach(pid, SIGKILL);
+      return -1;
+    }
+
     pt_close(pid, STDERR_FILENO);
     pt_close(pid, STDOUT_FILENO);
     pt_close(pid, STDIN_FILENO);
 
-    pt_dup2(pid, stdio, STDIN_FILENO);
-    pt_dup2(pid, stdio, STDOUT_FILENO);
-    pt_dup2(pid, stdio, STDERR_FILENO);
+    if(pt_dup2(pid, stdio, STDIN_FILENO) < 0
+       || pt_dup2(pid, stdio, STDOUT_FILENO) < 0
+       || pt_dup2(pid, stdio, STDERR_FILENO) < 0) {
+      LOG_PT_PERROR(pid, "redirect stdio");
+      pt_detach(pid, SIGKILL);
+      return -1;
+    }
 
     pt_close(pid, stdio);
   }
 
   if(elfldr_prepare_exec(pid, elf)) {
-    error = -1;
+    pt_detach(pid, SIGKILL);
+    return -1;
   }
 
   if(pt_detach(pid, 0)) {
@@ -566,10 +566,21 @@ elfldr_set_stdio(pid_t pid, int stdio) {
   return err;
 }
 
+typedef struct {
+  char *const *argv;
+  volatile int go;
+} spawn_ctx_t;
+
 static int
-elfldr_rfork_entry(void *argv) {
+elfldr_rfork_entry(void *arg) {
   const char *SceSpZeroConf = "/system/vsh/app/NPXS21016/eboot.bin";
+  spawn_ctx_t *ctx = (spawn_ctx_t *)arg;
+  char *const *argv = ctx->argv;
   struct sched_param sp;
+
+  while(!ctx->go) {
+    sched_yield();
+  }
 
   if(syscall(0x23b, 0)) {
     LOG_PERROR("sys_budget_set");
@@ -589,7 +600,7 @@ elfldr_rfork_entry(void *argv) {
     return 0;
   }
 
-  if(ptrace(PT_TRACE_ME, 0, 0, 0)) {
+  if(pt_trace_me()) {
     LOG_PERROR("ptrace");
     return 0;
   }
@@ -605,34 +616,138 @@ elfldr_rfork_entry(void *argv) {
   return 0;
 }
 
-static int
-elfldr_wait_stopped(pid_t pid) {
-  for(int waited = 0; waited < SPAWN_TIMEOUT_MS; waited += 10) {
-    pid_t result = waitpid(pid, 0, WNOHANG);
+#define SPAWN_STAGE(pid, what) LOG_PRINTF("elfldr_spawn: pid %d: %s\n", pid, what)
 
-    if(result == pid) {
+/**
+ * Retail kernels drop tracing from a process when it execs a SELF that is not
+ * debuggable, unless the QA flags are marked valid and allow a user level
+ * debugger. Without that, a child that called PT_TRACE_ME runs free after
+ * exec and can pass its entry point before anything stops it.
+ **/
+static int
+elfldr_keep_trace_across_exec(void) {
+  unsigned long valid_addr = KERNEL_ADDRESS_TARGETID - 7;
+  uint8_t qaflags[16];
+  uint8_t valid;
+
+  if(!KERNEL_ADDRESS_TARGETID) {
+    errno = ENOSYS;
+    return -1;
+  }
+  if(kernel_copyout(valid_addr, &valid, sizeof(valid))) {
+    return -1;
+  }
+  if(!(valid & 0x04)) {
+    valid |= 0x04;
+    if(kernel_copyin(&valid, valid_addr, sizeof(valid))) {
+      return -1;
+    }
+  }
+  if(kernel_get_qaflags(qaflags)) {
+    return -1;
+  }
+  if(!(qaflags[1] & 0x01)) {
+    qaflags[1] |= 0x01;
+    if(kernel_set_qaflags(qaflags)) {
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Leave with the child stopped and traced by us, right after its exec.
+ * Returns 1 when the child kept its trace and stopped inside exec, 0 when the
+ * kernel dropped the trace and it had to be attached while running.
+ **/
+static int
+elfldr_stop_after_exec(pid_t pid) {
+  int status;
+
+  for(;;) {
+    if(!pt_attach(pid)) {
       return 0;
     }
-    if(result < 0 && errno != EINTR) {
+    if(errno != EBUSY) {
+      return -1;
+    }
+
+    pid_t waited = waitpid(pid, &status, WNOHANG);
+
+    if(waited == pid) {
+      if(WIFSTOPPED(status)) {
+        return 1;
+      }
+      errno = ESRCH;
+      return -1;
+    }
+    if(waited < 0 && errno != EINTR) {
+      return -1;
+    }
+    usleep(1000);
+  }
+}
+
+/**
+ * Wait for the child to reach the breakpoint at its entry. A child that was
+ * stopped inside exec cannot miss it, so that wait has no limit. A child that
+ * had to be attached while running may already be past it, so that wait ends
+ * after ten seconds with the child killed.
+ **/
+static int
+elfldr_wait_stopped(pid_t pid, int held) {
+  int waited_ms = 0;
+  int status;
+
+  for(;;) {
+    pid_t waited = waitpid(pid, &status, held ? 0 : WNOHANG);
+
+    if(waited < 0) {
+      if(errno == EINTR) {
+        continue;
+      }
       LOG_PERROR("waitpid");
       pt_detach(pid, SIGKILL);
       return -1;
     }
-    usleep(10000);
-  }
+    if(!waited) {
+      if(waited_ms >= 10000) {
+        LOG_PRINTF("elfldr_spawn: pid %d ran past its entry before it was "
+                   "attached; killed\n",
+                   pid);
+        kill(pid, SIGKILL);
+        pt_detach(pid, SIGKILL);
+        while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
+        }
+        errno = ETIMEDOUT;
+        return -1;
+      }
+      usleep(10000);
+      waited_ms += 10;
+      continue;
+    }
 
-  LOG_PRINTF("elfldr_spawn: pid %d did not reach its entry in time; killed\n",
-             pid);
-  kill(pid, SIGKILL);
-  while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
+    if(!WIFSTOPPED(status)) {
+      LOG_PRINTF("elfldr_spawn: pid %d ended before reaching its entry\n", pid);
+      errno = ESRCH;
+      return -1;
+    }
+    if(WSTOPSIG(status) == SIGTRAP) {
+      return 0;
+    }
+
+    if(pt_continue(pid, WSTOPSIG(status))) {
+      LOG_PT_PERROR(pid, "pt_continue");
+      pt_detach(pid, SIGKILL);
+      return -1;
+    }
   }
-  return -1;
 }
 
 pid_t
 elfldr_spawn(const char *cwd, int stdio, char *const argv[],
              char *const envp[], const uint8_t *elf, size_t elf_size) {
-  const struct timespec spawn_timeout = { SPAWN_TIMEOUT_MS / 1000, 0 };
   uint8_t int3instr = 0xcc;
   struct kevent evt;
   intptr_t brkpoint;
@@ -651,6 +766,9 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 #endif
+  if(elfldr_keep_trace_across_exec()) {
+    LOG_PERROR("keep trace across exec");
+  }
 
   if((kq = kqueue()) < 0) {
     LOG_PERROR("kqueue");
@@ -663,8 +781,10 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
+  spawn_ctx_t ctx = { .argv = argv, .go = 0 };
+
   if((pid = rfork_thread(RFPROC | RFCFDG | RFMEM, stack + MB(2),
-                         elfldr_rfork_entry, (void *)argv))
+                         elfldr_rfork_entry, &ctx))
      < 0) {
     LOG_PERROR("rfork_thread");
     mem_free(stack);
@@ -673,8 +793,8 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   }
 
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC | NOTE_EXIT, 0, 0);
-  if(kevent(kq, &evt, 1, &evt, 1, &spawn_timeout) <= 0) {
-    LOG_PRINTF("elfldr_spawn: pid %d did not exec in time\n", pid);
+  if(kevent(kq, &evt, 1, 0, 0, 0) < 0) {
+    LOG_PERROR("kevent");
     kill(pid, SIGKILL);
     while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
     }
@@ -683,21 +803,20 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
-  usleep(20000);
+  ctx.go = 1;
 
-  unsigned int attach_attempt = 0;
-  unsigned int attach_timeouts = 0;
-  while(pt_attach(pid) == -1) {
-    if(errno == EBUSY && ++attach_attempt < 1000) {
-      continue;
+  int nevents;
+
+  SPAWN_STAGE(pid, "forked, waiting for exec");
+
+  while((nevents = kevent(kq, 0, 0, &evt, 1, 0)) < 0 && errno == EINTR) {
+  }
+  if(nevents < 0 || !(evt.fflags & NOTE_EXEC)) {
+    if(nevents < 0) {
+      LOG_PERROR("kevent");
+    } else {
+      LOG_PRINTF("elfldr_spawn: pid %d exited before exec\n", pid);
     }
-    if(errno == ETIMEDOUT && ++attach_timeouts < 3) {
-      usleep(50000);
-      continue;
-    }
-    LOG_PRINTF("elfldr_spawn: PT_ATTACH failed pid=%d attempt=%u errno=%d\n",
-               pid, attach_attempt + 1, errno);
-    LOG_PERROR("pt_attach after exec");
     kill(pid, SIGKILL);
     while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
     }
@@ -705,6 +824,21 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     close(kq);
     return -1;
   }
+
+  int held = elfldr_stop_after_exec(pid);
+
+  if(held < 0) {
+    LOG_PERROR("stop after exec");
+    kill(pid, SIGKILL);
+    while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
+    }
+    mem_free(stack);
+    close(kq);
+    return -1;
+  }
+  SPAWN_STAGE(pid, held ? "stopped inside exec"
+                        : "trace dropped at exec, attached while running");
+
   if(elfldr_raise_privileges(pid)) {
     LOG_PERROR("elfldr_raise_privileges");
     pt_detach(pid, SIGKILL);
@@ -715,6 +849,8 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
 
   mem_free(stack);
   close(kq);
+
+  SPAWN_STAGE(pid, "attached, relocating");
 
   if(kernel_get_fw_version() < 0x14020000
      && pt_dynlib_process_needed_and_relocate(pid)) {
@@ -745,14 +881,18 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
+  SPAWN_STAGE(pid, "running to its entry");
+
   if(pt_continue(pid, SIGCONT)) {
     LOG_PT_PERROR(pid, "pt_continue");
     pt_detach(pid, SIGKILL);
     return -1;
   }
-  if(elfldr_wait_stopped(pid)) {
+  if(elfldr_wait_stopped(pid, held)) {
     return -1;
   }
+
+  SPAWN_STAGE(pid, "at its entry, loading the ELF");
   if(pt_copyin(pid, &orginstr, brkpoint, sizeof(orginstr))) {
     LOG_PT_PERROR(pid, "pt_copyin");
     pt_detach(pid, SIGKILL);
@@ -775,9 +915,13 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
   if(elfldr_exec(pid, stdio, elf)) {
+    LOG_PRINTF("elfldr_spawn: pid %d: elfldr_exec failed errno=%d\n", pid,
+               errno);
     kill(pid, SIGKILL);
     return -1;
   }
+
+  SPAWN_STAGE(pid, "ELF loaded and running");
 
   return pid;
 }

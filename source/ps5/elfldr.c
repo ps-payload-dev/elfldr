@@ -21,6 +21,7 @@ along with this program; see the file COPYING. If not, see
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,7 +137,7 @@ elfldr_load(pid_t pid, const uint8_t *elf) {
     }
 
     const Elf64_Rela *rela = (const Elf64_Rela *)(elf + shdr[i].sh_offset);
-    for(int j = 0; j < shdr[i].sh_size / sizeof(Elf64_Rela); j++) {
+    for(int j = 0; j < shdr[i].sh_size / sizeof(Elf64_Rela) && !error; j++) {
       switch(rela[j].r_info & 0xffffffffl) {
         case R_X86_64_RELATIVE:
           error = r_relative(&ctx, &rela[j]);
@@ -360,41 +361,49 @@ elfldr_exec(pid_t pid, int stdio, const uint8_t *elf) {
   jaildir = kernel_get_proc_jaildir(pid);
   if(!(rootdir = kernel_get_proc_rootdir(pid))) {
     LOG_PUTS("kernel_get_proc_rootdir failed");
-    pt_detach(pid, 0);
+    pt_detach(pid, SIGKILL);
     return -1;
   }
   if(kernel_get_ucred_caps(pid, caps)) {
     LOG_PUTS("kernel_get_ucred_caps failed");
-    pt_detach(pid, 0);
+    pt_detach(pid, SIGKILL);
     return -1;
   }
   if(!(authid = kernel_get_ucred_authid(pid))) {
     LOG_PUTS("kernel_get_ucred_authid failed");
-    pt_detach(pid, 0);
+    pt_detach(pid, SIGKILL);
     return -1;
   }
 
   if(elfldr_raise_privileges(pid)) {
     LOG_PUTS("Unable to raise privileges");
-    pt_detach(pid, 0);
+    pt_detach(pid, SIGKILL);
     return -1;
   }
 
   if(stdio > 0) {
     stdio = pt_rdup(pid, getpid(), stdio);
 
-    pt_close(pid, STDERR_FILENO);
-    pt_close(pid, STDOUT_FILENO);
-    pt_close(pid, STDIN_FILENO);
+    if(stdio < 0) {
+      LOG_PT_PERROR(pid, "pt_rdup");
+      error = -1;
+    } else {
+      pt_close(pid, STDERR_FILENO);
+      pt_close(pid, STDOUT_FILENO);
+      pt_close(pid, STDIN_FILENO);
 
-    pt_dup2(pid, stdio, STDIN_FILENO);
-    pt_dup2(pid, stdio, STDOUT_FILENO);
-    pt_dup2(pid, stdio, STDERR_FILENO);
+      if(pt_dup2(pid, stdio, STDIN_FILENO) < 0
+         || pt_dup2(pid, stdio, STDOUT_FILENO) < 0
+         || pt_dup2(pid, stdio, STDERR_FILENO) < 0) {
+        LOG_PT_PERROR(pid, "redirect stdio");
+        error = -1;
+      }
 
-    pt_close(pid, stdio);
+      pt_close(pid, stdio);
+    }
   }
 
-  if(elfldr_prepare_exec(pid, elf)) {
+  if(!error && elfldr_prepare_exec(pid, elf)) {
     error = -1;
   }
 
@@ -416,7 +425,7 @@ elfldr_exec(pid_t pid, int stdio, const uint8_t *elf) {
     error = -1;
   }
 
-  if(pt_detach(pid, 0)) {
+  if(pt_detach(pid, error ? SIGKILL : 0)) {
     LOG_PERROR("pt_detach");
     error = -1;
   }
@@ -561,8 +570,20 @@ sys_budget_set(long budget) {
   return __syscall(0x23b, budget);
 }
 
+typedef struct {
+  char *const *argv;
+  volatile int go;
+} spawn_ctx_t;
+
 static int __attribute__((force_align_arg_pointer))
-elfldr_rfork_entry(void *argv) {
+elfldr_rfork_entry(void *arg) {
+  spawn_ctx_t *ctx = (spawn_ctx_t *)arg;
+  char *const *argv = ctx->argv;
+
+  while(!ctx->go) {
+    sched_yield();
+  }
+
   if(sys_budget_set(0)) {
     LOG_PERROR("sys_budget_set");
     return -1;
@@ -580,7 +601,7 @@ elfldr_rfork_entry(void *argv) {
     return -1;
   }
 
-  if(ptrace(PT_TRACE_ME, 0, 0, 0)) {
+  if(pt_trace_me()) {
     LOG_PERROR("ptrace");
     return -1;
   }
@@ -629,10 +650,15 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
+  spawn_ctx_t ctx = { .argv = argv, .go = 0 };
+
   if((pid = rfork_thread(RFPROC | RFCFDG | RFMEM, stack + PAGE_SIZE - 8,
-                         elfldr_rfork_entry, (void *)argv))
+                         elfldr_rfork_entry, &ctx))
      < 0) {
     LOG_PERROR("rfork_thread");
+    if(move_cwd && have_cwd) {
+      chdir(old_cwd);
+    }
     mem_free(stack);
     close(kq);
     return -1;
@@ -643,7 +669,23 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   }
 
   EV_SET(&evt, pid, EVFILT_PROC, EV_ADD, NOTE_EXEC, 0, 0);
-  if(kevent(kq, &evt, 1, &evt, 1, 0) < 0) {
+  if(kevent(kq, &evt, 1, 0, 0, 0) < 0) {
+    LOG_PERROR("kevent");
+    kill(pid, SIGKILL);
+    while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {
+    }
+    mem_free(stack);
+    close(kq);
+    return -1;
+  }
+
+  ctx.go = 1;
+
+  int nevents;
+
+  while((nevents = kevent(kq, 0, 0, &evt, 1, 0)) < 0 && errno == EINTR) {
+  }
+  if(nevents < 0) {
     LOG_PERROR("kevent");
     kill(pid, SIGKILL);
     while(waitpid(pid, 0, 0) < 0 && errno == EINTR) {

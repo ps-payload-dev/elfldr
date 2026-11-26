@@ -272,6 +272,8 @@ elfldr_find_pid(const char *name) {
     return -1;
   }
 
+  buf_size += buf_size / 8;
+
   if(!(buf = mem_alloc(buf_size))) {
     LOG_PERROR("malloc");
     return -1;
@@ -288,6 +290,9 @@ elfldr_find_pid(const char *name) {
     pid_t ki_pid = *(pid_t *)&ptr[72];
     char *ki_tdname = (char *)&ptr[447];
 
+    if(ki_structsize <= 0) {
+      break;
+    }
     ptr += ki_structsize;
     if(!strcmp(name, ki_tdname) && ki_pid != mypid) {
       pid = ki_pid;

@@ -16,6 +16,7 @@ along with this program; see the file COPYING. If not, see
 <http://www.gnu.org/licenses/>.  */
 
 #include <ps5/kernel.h>
+#include <signal.h>
 #include <sys/thr.h>
 #include <unistd.h>
 
@@ -26,6 +27,8 @@ along with this program; see the file COPYING. If not, see
 #include <ptrace.h>
 
 INCASSET(bootstrap_elf, "build/ps5/objects/bootstrap.elf");
+
+static char *const bootstrap_argv[] = { "elfldr-bootstrap", 0 };
 
 int
 main() {
@@ -58,6 +61,20 @@ main() {
       LOG_PUTS("kernel_set_qa_flags failed");
       return -1;
     }
+  }
+
+  if(elfldr_find_pid("elfldr.elf") > 0) {
+    LOG_PUTS("elfldr.elf is already running, replacing it");
+    notify("Replacing elfldr.elf...");
+
+    signal(SIGCHLD, SIG_IGN);
+    if(elfldr_spawn(-1, bootstrap_argv, bootstrap_elf, bootstrap_elf_size)
+       < 0) {
+      LOG_PUTS("Unable to spawn bootstrap.elf");
+      return -1;
+    }
+
+    return 0;
   }
 
   if(!(vnode = kernel_get_proc_rootdir(mypid))) {
