@@ -618,12 +618,6 @@ elfldr_rfork_entry(void *arg) {
 
 #define SPAWN_STAGE(pid, what) LOG_PRINTF("elfldr_spawn: pid %d: %s\n", pid, what)
 
-/**
- * Retail kernels drop tracing from a process when it execs a SELF that is not
- * debuggable, unless the QA flags are marked valid and allow a user level
- * debugger. Without that, a child that called PT_TRACE_ME runs free after
- * exec and can pass its entry point before anything stops it.
- **/
 static int
 elfldr_keep_trace_across_exec(void) {
   unsigned long valid_addr = KERNEL_ADDRESS_TARGETID - 7;
@@ -634,15 +628,6 @@ elfldr_keep_trace_across_exec(void) {
     errno = ENOSYS;
     return -1;
   }
-  if(kernel_copyout(valid_addr, &valid, sizeof(valid))) {
-    return -1;
-  }
-  if(!(valid & 0x04)) {
-    valid |= 0x04;
-    if(kernel_copyin(&valid, valid_addr, sizeof(valid))) {
-      return -1;
-    }
-  }
   if(kernel_get_qaflags(qaflags)) {
     return -1;
   }
@@ -652,8 +637,32 @@ elfldr_keep_trace_across_exec(void) {
       return -1;
     }
   }
+  if(kernel_copyout(valid_addr, &valid, sizeof(valid))) {
+    return -1;
+  }
+  if(valid & 0x04) {
+    return 0;
+  }
+  valid |= 0x04;
+  if(kernel_copyin(&valid, valid_addr, sizeof(valid))) {
+    return -1;
+  }
 
-  return 0;
+  return 1;
+}
+
+static void
+elfldr_drop_trace_across_exec(int raised) {
+  unsigned long valid_addr = KERNEL_ADDRESS_TARGETID - 7;
+  uint8_t valid;
+
+  if(raised <= 0 || kernel_copyout(valid_addr, &valid, sizeof(valid))) {
+    return;
+  }
+  valid &= ~0x04;
+  if(kernel_copyin(&valid, valid_addr, sizeof(valid))) {
+    LOG_PERROR("drop trace across exec");
+  }
 }
 
 /**
@@ -766,9 +775,7 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 #endif
-  if(elfldr_keep_trace_across_exec()) {
-    LOG_PERROR("keep trace across exec");
-  }
+  int raised = 0;
 
   if((kq = kqueue()) < 0) {
     LOG_PERROR("kqueue");
@@ -803,6 +810,10 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
     return -1;
   }
 
+  if((raised = elfldr_keep_trace_across_exec()) < 0) {
+    LOG_PERROR("keep trace across exec");
+  }
+
   ctx.go = 1;
 
   int nevents;
@@ -812,6 +823,7 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   while((nevents = kevent(kq, 0, 0, &evt, 1, 0)) < 0 && errno == EINTR) {
   }
   if(nevents < 0 || !(evt.fflags & NOTE_EXEC)) {
+    elfldr_drop_trace_across_exec(raised);
     if(nevents < 0) {
       LOG_PERROR("kevent");
     } else {
@@ -826,6 +838,8 @@ elfldr_spawn(const char *cwd, int stdio, char *const argv[],
   }
 
   int held = elfldr_stop_after_exec(pid);
+
+  elfldr_drop_trace_across_exec(raised);
 
   if(held < 0) {
     LOG_PERROR("stop after exec");
